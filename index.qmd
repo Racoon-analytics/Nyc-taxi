@@ -1,0 +1,667 @@
+---
+title: "Final_Project"
+author: "Illia Narbut, Denys Semenets, Andrii Kondratok"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    theme: flatly
+    fig-width: 10
+    fig-height: 8
+    df-print: default
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+# Мета роботи
+
+Наша команда має на меті два завдання: охарактеризувати таку демографічну ознаку NYC як сальдо міграцій, а також поглянути на кореляцію між кількістю визваних таксі та правопорушенями 311 в районі. Адже логічно, що чим більше умовних хімічних викидів, тим менше ти хочеш ходити ногами, і бажаєш шидше діствтись свого місця призначення.
+
+# Підготовка до роботи
+
+Почнемо зі скрипта для даних про правопорушення:\
+
+```{r}
+#| eval: false
+
+con <- dbConnect(duckdb())
+
+
+
+
+dbExecute(con, paste0(
+  "COPY (SELECT * FROM read_csv_auto('", path_to_csv, "'))
+   TO '", path_to_parquet, "' (FORMAT 'parquet')"
+))
+
+
+project <- here( "project.parquet")
+safety <- here("safety.parquet")
+
+
+ds <- open_dataset(project)
+ds_safety <- ds |>
+  select("Unique Key","Created Date",          
+         "Closed Date","Agency",                
+         "Complaint Type","City",                  
+         "Open Data Channel Type","Latitude",              
+         "Longitude","Location")
+
+write_parquet(ds_safety, safety)
+```
+
+Дані у форматі паркет важать набагато менше, ніж у csv, тому переводимо сіесвішку у інший формат. Також фільтруємо колонки, лишаємо лише необхідні нам.\
+
+```{r setup}
+library(arrow)
+library(here)
+library(dplyr)
+library(sf)
+library(ggplot2)
+library(tigris)
+library(viridis)
+library(tidyverse)
+library(knitr)
+library(leaflet)
+library(kableExtra)
+library(scales)
+library(patchwork)
+library(htmltools)
+library(plotly)
+library(purrr)
+library(tidyr)
+rm(list = ls())
+gc()
+options(tigris_use_cache = TRUE)
+
+```
+
+```{r}
+data <- read_parquet("project.parquet")
+subway <- read_csv("subway.csv")
+subway_points <- st_as_sf(subway, 
+                              coords = c("Station Longitude","Station Latitude"), 
+                              crs = 4326)
+uniq <- unique(data$`Complaint Type`) # to see all the different complaint types
+```
+
+project.parquet — це датасет із правопорушеннями. Ми будемо дивитися на кілька видів цих правопорушень, які логічно мають більший вплив на поведінку людей.
+
+```{r}
+
+airport <- read_csv("airport.csv")
+```
+
+Для обчислення сальдо міграцій, нам потрібна інформація про аеропорти. А саме — їхня локація. Потім ми обрахуємо кількість людей, які прилетіли, і викдикали таксі з аеропорту, і які полетіли — їхали в аеропорт.
+
+```{r}
+nyc_zips <- zctas(state = "NY", year = 2010) |> st_transform(4326)
+```
+
+Завантажуємо поштові індекси для Нью-Йорку за 2010 рік, і трансформуємо їх у зручний для візуалізацій формат.
+
+```{r}
+bbox <- st_bbox(c(xmin = -74.3, xmax = -73.7, ymin = 40.5, ymax = 40.95), crs = 4326) # some optimization by keeping only NYC, not the entire US (GPT made coordiantes)
+nyc_zips_filtered <- st_crop(nyc_zips, bbox)
+```
+
+# Візуалізації
+
+Почнемо із візуалізації усіх порушень в NYC
+
+```{r}
+set_complaint_type <- "Drinking Water"
+incident_data <- data |> 
+  filter(!is.na(Latitude) & !is.na(Longitude)) |> 
+  filter(Longitude >= -74.3 & Longitude <= -73.7) |> 
+  filter(Latitude >= 40.5 & Latitude <= 40.95)
+
+incident_sf <- st_as_sf(incident_data, coords = c("Longitude", "Latitude"), crs = 4326)
+
+incident_with_zip <- st_join(incident_sf, nyc_zips_filtered, left = FALSE)
+
+incidents_counts <- incident_with_zip |> 
+  st_drop_geometry() |> 
+  group_by(ZCTA5CE10) |> 
+  summarise(pickup_count = n(), .groups = "drop") |> 
+  filter(!is.na(ZCTA5CE10)) |> 
+  arrange(desc(pickup_count))
+
+incidents_map_data <- nyc_zips |> 
+  inner_join(incidents_counts, by = "ZCTA5CE10")
+ggplot() +
+  geom_sf(data = nyc_zips, fill = "gray95", color = "white", size = 0.1) +
+  geom_sf(data = incidents_map_data, aes(fill = pickup_count), color = "white", size = 0.1) +
+  scale_fill_viridis(option = "plasma", trans = "log10", 
+                     name = "Incident Count\n(log scale)",
+                     labels = scales::comma) +
+  geom_sf(data = subway_points, color = "black", size = 0.5, alpha = 0.6) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "All Incidents Locations Heatmap"
+  ) +
+  coord_sf(xlim = c(-74.3, -73.7), ylim = c(40.5, 40.95))
+```
+
+Бачимо, що загальна кількість порушень височенна майже у всіх поштових індексах. Це не надто допоможе при аналізі, тому навчимось робити карти лише певних порушень
+
+```{r}
+set_complaint_type <- "Drinking Water" 
+incident_data <- data |> 
+  filter(`Complaint Type` == set_complaint_type) |> 
+  filter(!is.na(Latitude) & !is.na(Longitude)) |> 
+  filter(Longitude >= -74.3 & Longitude <= -73.7) |> 
+  filter(Latitude >= 40.5 & Latitude <= 40.95)
+```
+
+Саме тут і відбувається бажана нами фільтрація. Решта коду ідентична
+
+```{r}
+incident_sf <- st_as_sf(incident_data, coords = c("Longitude", "Latitude"), crs = 4326)
+
+incident_with_zip <- st_join(incident_sf, nyc_zips_filtered, left = FALSE)
+
+incidents_counts <- incident_with_zip |> 
+  st_drop_geometry() |> 
+  group_by(ZCTA5CE10) |> 
+  summarise(pickup_count = n(), .groups = "drop") |> 
+  filter(!is.na(ZCTA5CE10)) |> 
+  arrange(desc(pickup_count))
+
+incidents_map_data <- nyc_zips |> 
+  inner_join(incidents_counts, by = "ZCTA5CE10")
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = nyc_zips, fill = "gray95", color = "white", size = 0.1) +
+  geom_sf(data = incidents_map_data, aes(fill = pickup_count), color = "white", size = 0.1) +
+  geom_sf(data = subway_points, color = "black", size = 0.5, alpha = 0.6) +
+  scale_fill_viridis(option = "plasma", trans = "log10", 
+                     name = "Incident Count\n(log scale)",
+                     labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Drinking Water Incidents Locations Heatmap"
+  ) +
+  coord_sf(xlim = c(-74.3, -73.7), ylim = c(40.5, 40.95)) # to show specifically nyc
+```
+
+Нам не дуже цікава питна вода, проте візуалізація успішна
+
+```{r}
+options(tigris_use_cache = TRUE)
+
+nyc <- open_dataset("nyc-taxi", format = "parquet")
+```
+
+```{r}
+
+taxi_coords <- nyc |> 
+  filter(!is.na(pickup_longitude) & !is.na(pickup_latitude)) |> 
+  filter(pickup_longitude > -74.3 & pickup_longitude < -73.7) |> 
+  filter(pickup_latitude > 40.5 & pickup_latitude < 40.95) |> 
+  select(pickup_longitude, pickup_latitude) |> 
+  head(500000) |> # I dare you to make it higher
+  collect()
+```
+
+```{r}
+taxi_sf <- st_as_sf(taxi_coords, coords = c("pickup_longitude", "pickup_latitude"), crs = 4326)
+```
+
+Як і раніше, переводимо у зручний для візуалізацій формат. Нас цікавлять координати, де людей підбирало таксі (не хотіли ЗВІДТИ йти пішки, можливо щось заважало)
+
+```{r}
+bbox <- st_bbox(c(xmin = -74.3, xmax = -73.7, ymin = 40.5, ymax = 40.95), crs = 4326) # some optimization by keeping only NYC, not the entire US (GPT made coordinates)
+nyc_zips_filtered <- st_crop(nyc_zips, bbox)
+
+taxis_with_zip <- st_join(taxi_sf, nyc_zips_filtered)
+```
+
+Обмежуємо координати до NYC, поштові індексти теж, і в кінці об'єднуємо ці дані.
+
+```{r}
+taxis_counts <- taxis_with_zip |> 
+  st_drop_geometry() |> 
+  group_by(ZCTA5CE10) |> 
+  summarise(pickup_count = n(), .groups = "drop") |> 
+  filter(!is.na(ZCTA5CE10)) |> 
+  arrange(desc(pickup_count))
+
+taxis_map_data <- nyc_zips |> 
+  inner_join(taxis_counts, by = "ZCTA5CE10")
+
+airport_sf <- st_as_sf(airport, wkt = "the_geom", crs = 4326)
+airport_points <- st_centroid(airport_sf)
+```
+
+Цей блок рахує кількість пік-апів у регіонах поштових індексів, а також у аеропортах.
+
+Візуалізація усіх пік-апів по NYC. З точками у двох аеропортах.
+
+```{r}
+taxi_data <- nyc |> 
+  filter(!is.na(pickup_longitude) & !is.na(pickup_latitude)) |> 
+  filter(!is.na(dropoff_longitude) & !is.na(dropoff_latitude)) |> 
+  filter(pickup_longitude > -74.3 & pickup_longitude < -73.7) |> 
+  filter(pickup_latitude > 40.5 & pickup_latitude < 40.95) |> 
+  select(pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude) |> 
+  head(500000) |> 
+  collect()
+
+taxi_pickup_sf <- st_as_sf(taxi_data, coords = c("pickup_longitude", "pickup_latitude"), crs = 4326)
+
+nyc_zips <- zctas(state = "NY", year = 2010) |>  st_transform(4326)
+
+bbox <- st_bbox(c(xmin = -74.3, xmax = -73.7, ymin = 40.5, ymax = 40.95), crs = 4326)
+nyc_zips_filtered <- st_crop(nyc_zips, bbox)
+
+taxis_with_zip <- st_join(taxi_pickup_sf, nyc_zips_filtered)
+
+taxis_counts <- taxis_with_zip |> 
+  st_drop_geometry() |> 
+  group_by(ZCTA5CE10) |> 
+  summarise(pickup_count = n(), .groups = "drop") |> 
+  filter(!is.na(ZCTA5CE10))
+
+taxis_map_data <- nyc_zips_filtered |> 
+  left_join(taxis_counts, by = "ZCTA5CE10") |> 
+  mutate(pickup_count = ifelse(is.na(pickup_count), 0, pickup_count))
+
+airport_sf <- st_as_sf(airport, wkt = "the_geom", crs = 4326)
+airport_points <- st_centroid(airport_sf)
+
+taxi_data_full <- taxi_data |> 
+  mutate(
+    pickup_coords = st_as_sf(data.frame(lon = pickup_longitude, lat = pickup_latitude), 
+                             coords = c("lon", "lat"), crs = 4326),
+    dropoff_coords = st_as_sf(data.frame(lon = dropoff_longitude, lat = dropoff_latitude), 
+                              coords = c("lon", "lat"), crs = 4326)
+  )
+
+airport_stats <- lapply(1:nrow(airport_points), function(i) {
+  airport_center <- airport_points[i, ]
+  airport_coords <- st_coordinates(airport_center)
+  
+  nearby_pickups <- taxi_data |> 
+    filter(
+      abs(pickup_longitude - airport_coords[1]) < 0.015,
+      abs(pickup_latitude - airport_coords[2]) < 0.015
+    )
+  
+  if(nrow(nearby_pickups) > 0) {
+    nearby_pickup_sf <- st_as_sf(nearby_pickups, 
+                                 coords = c("pickup_longitude", "pickup_latitude"), 
+                                 crs = 4326)
+    pickup_distances <- st_distance(nearby_pickup_sf, airport_center)
+    pickup_count <- sum(pickup_distances <= units::set_units(1000, "m"))
+  } else {
+    pickup_count <- 0
+  }
+  
+  nearby_dropoffs <- taxi_data |> 
+    filter(
+      abs(dropoff_longitude - airport_coords[1]) < 0.015,
+      abs(dropoff_latitude - airport_coords[2]) < 0.015
+    )
+  
+  if(nrow(nearby_dropoffs) > 0) {
+    nearby_dropoff_sf <- st_as_sf(nearby_dropoffs, 
+                                  coords = c("dropoff_longitude", "dropoff_latitude"), 
+                                  crs = 4326)
+    dropoff_distances <- st_distance(nearby_dropoff_sf, airport_center)
+    dropoff_count <- sum(dropoff_distances <= units::set_units(1000, "m"))
+  } else {
+    dropoff_count <- 0
+  }
+  
+  list(
+    name = airport$NAME[i],
+    pickups = pickup_count,
+    dropoffs = dropoff_count
+  )
+})
+```
+
+Беремо семпл координат таксі, переводимо у просторові об'єкти. далі рахуємо кількість пікапів по координатах, приєднуємо до датасету поштових індексів.
+
+Далі безіменна функція для обрахунку дропофів та пікапів біля аеропортів (1км радіус)
+
+```{r}
+pal <- colorNumeric(palette = viridis(100, option = "plasma"), 
+                    domain = log10(taxis_map_data$pickup_count + 1))
+leaflet() |> 
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    data = taxis_map_data,
+    fillColor = ~pal(log10(pickup_count + 1)),
+    fillOpacity = 0.6,
+    color = "white",
+    weight = 0.5,
+    popup = ~paste0("ZIP: ", ZCTA5CE10, "<br>Pickups: ", format(pickup_count, big.mark = ","))
+  ) |>
+  addCircleMarkers(
+    data = airport_points,
+    radius = 8,
+    color = "red",
+    fillColor = "red",
+    fillOpacity = 0.8,
+    weight = 2,
+    popup = ~paste0(
+      "<b>", sapply(airport_stats, function(x) x$name), "</b><br>",
+      "Pickups: ", format(sapply(airport_stats, function(x) x$pickups), big.mark = ","), "<br>",
+      "Dropoffs: ", format(sapply(airport_stats, function(x) x$dropoffs), big.mark = ",")
+    )
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = pal,
+    values = log10(taxis_map_data$pickup_count + 1),
+    title = "Pickups<br>(log scale)",
+    labFormat = labelFormat(transform = function(x) round(10^x))
+  )
+
+```
+
+Робимо інтерактивну мапу через leflet. При натисненні на поштовий індекс чи аеропорт — виведеться коротенька статистика по кількості пікапів та (для аеропортів) дропофів.
+
+```{r}
+airport_tbl <- data.frame(
+  airport  = sapply(airport_stats, `[[`, "name"),
+  pickups  = sapply(airport_stats, `[[`, "pickups"),
+  dropoffs = sapply(airport_stats, `[[`, "dropoffs"),
+  check.names = FALSE
+) |>
+  mutate(balance = pickups - dropoffs)
+
+total_row <- airport_tbl |>
+  summarise(
+    airport  = "TOTAL",
+    pickups  = sum(pickups,  na.rm = TRUE),
+    dropoffs = sum(dropoffs, na.rm = TRUE),
+    balance  = sum(balance,  na.rm = TRUE)
+  )
+
+airport_tbl_final <- bind_rows(airport_tbl, total_row)
+
+fmt <- function(x) comma(x, accuracy = 1, big.mark = ",")
+
+styled_tbl <- airport_tbl_final |>
+  mutate(
+    pickups_txt  = fmt(pickups),
+    dropoffs_txt = fmt(dropoffs),
+    balance_txt  = fmt(balance),
+    pickups_txt  = cell_spec(pickups_txt,  color = "white", background = "#1a9850", bold = TRUE,
+                             extra_css = "border-radius:4px; padding:0 6px;"),
+    dropoffs_txt = cell_spec(dropoffs_txt, color = "white", background = "#d73027", bold = TRUE,
+                             extra_css = "border-radius:4px; padding:0 6px;"),
+    balance_txt  = cell_spec(balance_txt,  color = "white",
+                             background = ifelse(balance >= 0, "#1a9850", "#d73027"),
+                             bold = TRUE, extra_css = "border-radius:4px; padding:0 6px;")
+  ) |>
+  select(
+    airport,
+    `pick-ups` = pickups_txt,
+    `drop-offs` = dropoffs_txt,
+    balance = balance_txt
+  )
+
+styled_tbl |>
+  kbl(format = "html", escape = FALSE, caption = "Сальдо міграцій по аеропортах NYC",
+      align = c("l", "r", "r", "r")) |>
+  kable_paper("hover", full_width = FALSE, html_font = "Helvetica") |>
+  column_spec(1, bold = TRUE, width = "12em") |>
+  row_spec(nrow(styled_tbl), bold = TRUE, background = "#f0f0f0")
+```
+
+Сальдо міграцій позитивне. Приїжджає удвічі більше, ніж їде. Проблема лише в тому, що із часом це може привести до перенаселення міста. **Важливий інсайт** — місто популярне серед туристів. Радше за все, потрібно ораганізувати більше місць для їхніх розваг, особливо біля океану. Це принесе багато доходу в казну міста.
+
+```{r}
+leaflet() |> 
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    data = taxis_map_data,
+    fillColor = ~pal(log10(pickup_count + 1)),
+    fillOpacity = 0.6,
+    color = "white",
+    weight = 0.5,
+    popup = ~paste0("ZIP: ", ZCTA5CE10, "<br>Pickups: ", format(pickup_count, big.mark = ","))
+  ) |>
+  addCircleMarkers(
+    data = airport_points,
+    radius = 8,
+    color = "red",
+    fillColor = "red",
+    fillOpacity = 0.8,
+    weight = 2,
+    popup = ~paste0(
+      "<b>", sapply(airport_stats, function(x) x$name), "</b><br>",
+      "Pickups: ", format(sapply(airport_stats, function(x) x$pickups), big.mark = ","), "<br>",
+      "Dropoffs: ", format(sapply(airport_stats, function(x) x$dropoffs), big.mark = ",")
+    )
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = pal,
+    values = log10(taxis_map_data$pickup_count + 1),
+    title = "Pickups<br>(log scale)",
+    labFormat = labelFormat(transform = function(x) round(10^x))
+  )
+
+```
+
+```{r}
+#| echo: false
+set_complaint_type <- "Disorderly Youth"
+incident_data <- data |> 
+  filter(`Complaint Type` == set_complaint_type) |> 
+  filter(!is.na(Latitude) & !is.na(Longitude)) |> 
+  filter(Longitude >= -74.3 & Longitude <= -73.7) |> 
+  filter(Latitude >= 40.5 & Latitude <= 40.95)
+
+incident_sf <- st_as_sf(incident_data, coords = c("Longitude", "Latitude"), crs = 4326)
+
+incident_with_zip <- st_join(incident_sf, nyc_zips_filtered, left = FALSE)
+
+incidents_counts <- incident_with_zip |> 
+  st_drop_geometry() |> 
+  group_by(ZCTA5CE10) |> 
+  summarise(pickup_count = n(), .groups = "drop") |> 
+  filter(!is.na(ZCTA5CE10)) |> 
+  arrange(desc(pickup_count))
+
+incidents_map_data <- nyc_zips |> 
+  inner_join(incidents_counts, by = "ZCTA5CE10")
+```
+
+```{r}
+#| echo: false
+b <- ggplot() +
+  geom_sf(data = nyc_zips, fill = "gray95", color = "white", size = 0.1) +
+  geom_sf(data = incidents_map_data, aes(fill = pickup_count), color = "white", size = 0.1) +
+  scale_fill_viridis(option = "plasma", trans = "log10", 
+                     name = "Incident Count\n(log scale)",
+                     labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Disorderly Youth Incidents Locations Heatmap"
+  ) +
+  coord_sf(xlim = c(-74.3, -73.7), ylim = c(40.5, 40.95))
+b <- ggplotly(b)
+b
+```
+
+Кореляції немає. Бушуюча молодь не настільки bothering людей. Глянемо на хімічні витоки, проблеми із дорогами, і зробимо висновок по фінансуванню 311.
+
+```{r}
+nyc <- open_dataset("nyc-taxi", format = "parquet") 
+
+
+road_related <- c(
+  "Street Condition", "Highway Condition", "Bridge Condition",
+  "Tunnel Condition", "Curb Condition", "Sidewalk Condition",
+  "Root/Sewer/Sidewalk Condition", "Hazardous Materials", "Air Quality", "Radioactive Material"
+)
+
+trips_by_zip <- taxis_counts |>
+  select(ZCTA5CE10, trips_count = pickup_count)
+
+corr_for_type <- function(ct) {
+  one_type_pts <- data |>
+    filter(`Complaint Type` == ct) |>
+    filter(!is.na(Latitude) & !is.na(Longitude)) |>
+    filter(Longitude >= -74.3 & Longitude <= -73.7,
+           Latitude  >= 40.5  & Latitude  <= 40.95)
+
+  if (nrow(one_type_pts) == 0) {
+    return(tibble(`Complaint Type` = ct, n_zip = 0L, r = NA_real_))
+  }
+
+  one_type_sf  <- st_as_sf(one_type_pts, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+  one_type_zip <- suppressMessages(st_join(one_type_sf, nyc_zips_filtered, left = TRUE))
+
+  complaints_by_zip <- one_type_zip |>
+    st_drop_geometry() |>
+    count(ZCTA5CE10, name = "complaints_count") |>
+    filter(!is.na(ZCTA5CE10))
+
+  joined <- trips_by_zip |>
+    full_join(complaints_by_zip, by = "ZCTA5CE10") |>
+    mutate(
+      trips_count      = tidyr::replace_na(trips_count, 0L),
+      complaints_count = tidyr::replace_na(complaints_count, 0L)
+    )
+
+  tibble(
+    `Complaint Type` = ct,
+    n_zip = nrow(joined),
+    r = suppressWarnings(cor(joined$complaints_count, joined$trips_count, use = "complete.obs"))
+  )
+}
+
+road_cor <- purrr::map_dfr(road_related, corr_for_type) |>
+  arrange(desc(r))
+
+all_road_pts <- data |>
+  filter(`Complaint Type` %in% road_related) |>
+  filter(!is.na(Latitude) & !is.na(Longitude)) |>
+  filter(Longitude >= -74.3 & Longitude <= -73.7,
+         Latitude  >= 40.5  & Latitude  <= 40.95)
+
+if (nrow(all_road_pts) > 0) {
+  all_road_sf  <- st_as_sf(all_road_pts, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+  all_road_zip <- suppressMessages(st_join(all_road_sf, nyc_zips_filtered, left = TRUE))
+
+  all_complaints_by_zip <- all_road_zip |>
+    st_drop_geometry() |>
+    count(ZCTA5CE10, name = "complaints_count") |>
+    filter(!is.na(ZCTA5CE10))
+
+  overall_join <- trips_by_zip |>
+    full_join(all_complaints_by_zip, by = "ZCTA5CE10") |>
+    mutate(
+      trips_count      = tidyr::replace_na(trips_count, 0L),
+      complaints_count = tidyr::replace_na(complaints_count, 0L)
+    )
+
+  overall_r <- suppressWarnings(cor(overall_join$complaints_count, overall_join$trips_count, use = "complete.obs"))
+} else {
+  overall_r <- NA_real_
+}
+
+fmt_corr <- function(r) {
+  r_clean <- if (is.nan(r) || is.infinite(r)) NA_real_ else r
+  bg <- dplyr::case_when(
+    is.na(r_clean) ~ "#9e9e9e",
+    r_clean >= 0   ~ "#1a9850",
+    TRUE           ~ "#d73027"
+  )
+  txt <- if (is.na(r_clean)) "NA" else sprintf("%.3f", r_clean)
+  kableExtra::cell_spec(txt, color = "white", background = bg, bold = TRUE)
+}
+
+road_cor_tbl <- road_cor |>
+  mutate(`Correlation (r)` = vapply(r, fmt_corr, FUN.VALUE = character(1))) |>
+  select(`Complaint Type`, `ZIPs used` = n_zip, `Correlation (r)`)
+
+header_row <- tibble::tibble(
+  `Complaint Type` = "ALL ROAD TYPES (combined)",
+  `ZIPs used`      = nrow(trips_by_zip),
+  `Correlation (r)`= fmt_corr(overall_r)
+)
+
+final_tbl <- dplyr::bind_rows(header_row, road_cor_tbl)
+
+final_tbl |>
+  kbl(format = "html", escape = FALSE,
+      caption = "Кореляція між 311 дорожніми +  хім скаргами та кількістю поїздок (taxi pickups) по ZIP") |>
+  kable_paper("hover", full_width = FALSE, html_font = "Helvetica") |>
+  column_spec(1, bold = TRUE, width = "22em") |>
+  row_spec(1, bold = TRUE, background = "#f0f0f0") |>
+  row_spec(0, bold = TRUE, background = "#f7f7f7")
+```
+
+
+## How to make NYC Great Again
+
+Ми щиро вважаємо, що зменшення кількості таксі покращить життя NYC. Повітря буде чистіше, а люди здоровішими. 
+
+Отже ми вирішили зробити приблизну оцінку, що саме зміниться. Варто зауважити, що за здоров'я треба платити, але погіршувати фінансовий стан людей ми не збираємося, тому ми плануємо забирати у них лише стільки грошей, скільки вони б заплатили за таксі.
+
+```{r}
+
+city_data <- nyc |> 
+  summarise(
+    total_spendings = sum((fare_amount + extra), na.rm = TRUE),
+    total_miles = sum(trip_distance, na.rm = TRUE)
+  ) |> 
+  collect() 
+#  місто забирає близько 4.5% з кожного витраченого долара на таксі. Ми вважаємо що 50% таксі є необхідними, а інші прояви людської ліні. Тому загальні витрати на таксі які можна зекономити виглядають так. 
+
+tax_on_air <- city_data$total_spendings *(1 - 0.045) /2
+tax_on_air
+
+clean_air_delta <- city_data$total_miles * 0.5 *404/1000000 # метричних тон на рік (викиди CO2) 
+
+additional_people <- clean_air_delta /0.37 # Ми можемо приймати на 280294 людей більше не втрачаючи при цьому якості повітря, адже одна людина видихає приблизно 0.37 тонни на рік
+
+
+additional_people
+
+
+```
+
+Ви можете побачити, що місто зможе отримати додаткові 960 мілйонів, які ми пропонуємо проінвестувати у туризм. Ми пропонуємо побудувати готелі, пляжі та додаткові розваги для туристів.
+Це має допомогти нам заманити 280 тисяч людей, яких наше **рідне** повітря зможе прийняти за рахунок зменшення кількості викидів від машин. 
+
+
+
+# Висновки  
+
+Як ми бачимо, люди не починають частіше "тікати" та викликати таксі через незначні проблеми іщ дорогами чи хімією.
+
+Їх це не надто турбує, або не мають грошей на таксі. Висновки? Зменшити фінансування служби 311, особливо у багатих регіонах, і направити на туристичний бізнес, оскільки місто справді популярне серед туристів (згадуємо сальдо міграцій).
+
+Це принесе багато грошей у казну міста, із яких у майбутньому можна буде по трошки повертати фінансування 311
